@@ -132,6 +132,7 @@ const bookTitle = document.getElementById('book-title');
 const chapterTitle = document.getElementById('chapter-title');
 const chapterContent = document.getElementById('chapter-content');
 const downloadBtn = document.getElementById('download-btn');
+const downloadFullBookBtn = document.getElementById('download-full-book');
 const backToBooks = document.getElementById('back-to-books');
 const backToChapters = document.getElementById('back-to-chapters');
 
@@ -150,6 +151,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     backToBooks.addEventListener('click', showBooksSection);
     backToChapters.addEventListener('click', () => showChaptersSection(currentBook));
     downloadBtn.addEventListener('click', downloadChapter);
+    downloadFullBookBtn.addEventListener('click', downloadFullBook);
 });
 
 // Migrate existing data from localStorage to IndexedDB
@@ -606,6 +608,82 @@ function downloadChapter() {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
+}
+
+// Download entire book as .txt
+async function downloadFullBook() {
+    if (!currentBook) {
+        alert('No book selected');
+        return;
+    }
+    
+    downloadFullBookBtn.disabled = true;
+    downloadFullBookBtn.textContent = 'Processing...';
+    
+    try {
+        // Load EPUB file
+        const epubBlob = await epubDB.getEpubFile(currentBook.id);
+        if (!epubBlob) {
+            alert('EPUB file not found');
+            return;
+        }
+        
+        const arrayBuffer = await epubBlob.arrayBuffer();
+        const zip = await JSZip.loadAsync(arrayBuffer);
+        
+        // Extract all chapter content
+        let fullBookText = '';
+        fullBookText += `${currentBook.title}\n`;
+        fullBookText += '='.repeat(currentBook.title.length) + '\n\n';
+        
+        for (let i = 0; i < currentBook.chapters.length; i++) {
+            const chapter = currentBook.chapters[i];
+            
+            try {
+                // Get chapter content
+                const content = await zip.file(chapter.href).async('string');
+                const parser = new DOMParser();
+                const doc = parser.parseFromString(content, 'text/html');
+                
+                // Extract text content
+                const textContent = extractTextFromHtml(doc.body);
+                
+                // Add chapter to full text
+                fullBookText += `\n\n--- ${chapter.title} ---\n\n`;
+                fullBookText += textContent;
+                
+                // Add some spacing between chapters
+                if (i < currentBook.chapters.length - 1) {
+                    fullBookText += '\n\n';
+                }
+                
+            } catch (error) {
+                console.warn('Error processing chapter:', chapter.href, error);
+                fullBookText += `\n\n--- ${chapter.title} ---\n\n`;
+                fullBookText += '[Error loading chapter content]';
+            }
+        }
+        
+        // Create and download file
+        const fileName = `${currentBook.title.replace(/[^a-z0-9]/gi, '_')}_complete.txt`;
+        const blob = new Blob([fullBookText], { type: 'text/plain' });
+        const url = URL.createObjectURL(blob);
+        
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = fileName;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        
+    } catch (error) {
+        console.error('Error downloading full book:', error);
+        alert('Error downloading full book');
+    } finally {
+        downloadFullBookBtn.disabled = false;
+        downloadFullBookBtn.textContent = 'Download Full Book as .txt';
+    }
 }
 
 // Show books section

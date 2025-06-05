@@ -142,6 +142,16 @@ main {
     margin-left: 8px;
 }
 
+/* Book actions */
+.book-actions {
+    margin-bottom: 20px;
+    text-align: center;
+}
+
+.book-actions .btn {
+    margin: 0 8px;
+}
+
 /* Chapter content */
 .chapter-content {
     padding: 20px;
