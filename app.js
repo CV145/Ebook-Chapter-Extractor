@@ -2,6 +2,123 @@
 let currentBook = null;
 let currentChapterContent = '';
 
+// IndexedDB configuration
+const DB_NAME = 'EpubExtractorDB';
+const DB_VERSION = 1;
+const BOOKS_STORE = 'books';
+const EPUB_STORE = 'epubFiles';
+
+// IndexedDB utility functions
+class EpubDB {
+    constructor() {
+        this.db = null;
+    }
+
+    async init() {
+        return new Promise((resolve, reject) => {
+            const request = indexedDB.open(DB_NAME, DB_VERSION);
+            
+            request.onerror = () => reject(request.error);
+            request.onsuccess = () => {
+                this.db = request.result;
+                resolve(this.db);
+            };
+            
+            request.onupgradeneeded = (event) => {
+                const db = event.target.result;
+                
+                // Create books store for metadata
+                if (!db.objectStoreNames.contains(BOOKS_STORE)) {
+                    const booksStore = db.createObjectStore(BOOKS_STORE, { keyPath: 'id' });
+                    booksStore.createIndex('title', 'title', { unique: false });
+                }
+                
+                // Create epub files store for binary data
+                if (!db.objectStoreNames.contains(EPUB_STORE)) {
+                    db.createObjectStore(EPUB_STORE, { keyPath: 'id' });
+                }
+            };
+        });
+    }
+
+    async addBook(book, epubBlob) {
+        const transaction = this.db.transaction([BOOKS_STORE, EPUB_STORE], 'readwrite');
+        
+        try {
+            // Store book metadata
+            await this.promisifyRequest(
+                transaction.objectStore(BOOKS_STORE).add(book)
+            );
+            
+            // Store EPUB file
+            await this.promisifyRequest(
+                transaction.objectStore(EPUB_STORE).add({
+                    id: book.id,
+                    file: epubBlob,
+                    timestamp: Date.now()
+                })
+            );
+            
+            return book;
+        } catch (error) {
+            transaction.abort();
+            throw error;
+        }
+    }
+
+    async getAllBooks() {
+        const transaction = this.db.transaction([BOOKS_STORE], 'readonly');
+        const request = transaction.objectStore(BOOKS_STORE).getAll();
+        return this.promisifyRequest(request);
+    }
+
+    async getBook(id) {
+        const transaction = this.db.transaction([BOOKS_STORE], 'readonly');
+        const request = transaction.objectStore(BOOKS_STORE).get(id);
+        return this.promisifyRequest(request);
+    }
+
+    async getEpubFile(id) {
+        const transaction = this.db.transaction([EPUB_STORE], 'readonly');
+        const request = transaction.objectStore(EPUB_STORE).get(id);
+        const result = await this.promisifyRequest(request);
+        return result ? result.file : null;
+    }
+
+    async deleteBook(id) {
+        const transaction = this.db.transaction([BOOKS_STORE, EPUB_STORE], 'readwrite');
+        
+        try {
+            await this.promisifyRequest(
+                transaction.objectStore(BOOKS_STORE).delete(id)
+            );
+            await this.promisifyRequest(
+                transaction.objectStore(EPUB_STORE).delete(id)
+            );
+        } catch (error) {
+            transaction.abort();
+            throw error;
+        }
+    }
+
+    async getStorageEstimate() {
+        if ('storage' in navigator && 'estimate' in navigator.storage) {
+            return await navigator.storage.estimate();
+        }
+        return null;
+    }
+
+    promisifyRequest(request) {
+        return new Promise((resolve, reject) => {
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error);
+        });
+    }
+}
+
+// Global database instance
+const epubDB = new EpubDB();
+
 // DOM elements
 const fileInput = document.getElementById('file-input');
 const uploadBtn = document.getElementById('upload-btn');
@@ -19,8 +136,15 @@ const backToBooks = document.getElementById('back-to-books');
 const backToChapters = document.getElementById('back-to-chapters');
 
 // Initialize app
-document.addEventListener('DOMContentLoaded', () => {
-    loadBooks();
+document.addEventListener('DOMContentLoaded', async () => {
+    try {
+        await epubDB.init();
+        await migrateFromLocalStorage();
+        await loadBooks();
+    } catch (error) {
+        console.error('Failed to initialize database:', error);
+        alert('Failed to initialize storage. Some features may not work.');
+    }
     
     uploadBtn.addEventListener('click', handleUpload);
     backToBooks.addEventListener('click', showBooksSection);
@@ -28,24 +152,57 @@ document.addEventListener('DOMContentLoaded', () => {
     downloadBtn.addEventListener('click', downloadChapter);
 });
 
-// Load books from localStorage
-function loadBooks() {
-    const books = getStoredBooks();
-    if (books.length > 0) {
-        showBooksSection();
-        renderBooksList(books);
+// Migrate existing data from localStorage to IndexedDB
+async function migrateFromLocalStorage() {
+    try {
+        const oldBooksJson = localStorage.getItem('epubBooks');
+        if (!oldBooksJson) {
+            return; // No old data to migrate
+        }
+        
+        const oldBooks = JSON.parse(oldBooksJson);
+        if (oldBooks.length === 0) {
+            localStorage.removeItem('epubBooks');
+            return;
+        }
+        
+        // Check if migration already happened
+        const existingBooks = await epubDB.getAllBooks();
+        if (existingBooks.length > 0) {
+            return; // Already migrated or has new data
+        }
+        
+        console.log('Found old localStorage data, but cannot migrate EPUB files. Old data will be cleared.');
+        
+        // Clear old localStorage data since we can't migrate without original EPUB files
+        localStorage.removeItem('epubBooks');
+        
+        // Clear any old epub_ keys
+        const keysToRemove = [];
+        for (let i = 0; i < localStorage.length; i++) {
+            const key = localStorage.key(i);
+            if (key && key.startsWith('epub_')) {
+                keysToRemove.push(key);
+            }
+        }
+        keysToRemove.forEach(key => localStorage.removeItem(key));
+        
+    } catch (error) {
+        console.error('Error during migration:', error);
     }
 }
 
-// Get stored books from localStorage
-function getStoredBooks() {
-    const booksJson = localStorage.getItem('epubBooks');
-    return booksJson ? JSON.parse(booksJson) : [];
-}
-
-// Save books to localStorage
-function saveBooks(books) {
-    localStorage.setItem('epubBooks', JSON.stringify(books));
+// Load books from IndexedDB
+async function loadBooks() {
+    try {
+        const books = await epubDB.getAllBooks();
+        if (books.length > 0) {
+            showBooksSection();
+            renderBooksList(books);
+        }
+    } catch (error) {
+        console.error('Error loading books:', error);
+    }
 }
 
 // Handle file upload
@@ -56,30 +213,35 @@ async function handleUpload() {
         return;
     }
     
+    uploadBtn.disabled = true;
+    uploadBtn.textContent = 'Processing...';
+    
     try {
         const arrayBuffer = await file.arrayBuffer();
         const zip = await JSZip.loadAsync(arrayBuffer);
         
-        // Parse EPUB structure and extract all chapter content
-        const epubData = await parseEpubWithContent(zip);
+        // Parse EPUB structure (metadata only for now)
+        const epubData = await parseEpubStructure(zip);
         
-        // Create book object
+        // Create book object with metadata
         const book = {
             id: Date.now().toString(),
             title: epubData.title || file.name.replace('.epub', ''),
             fileName: file.name,
-            chapters: epubData.chapters
+            chapters: epubData.chapters,
+            uploadDate: new Date().toISOString(),
+            fileSize: file.size
         };
         
-        // Save to localStorage (only the parsed data, not the original EPUB)
-        const books = getStoredBooks();
-        books.push(book);
-        saveBooks(books);
+        // Create blob from the EPUB file
+        const epubBlob = new Blob([arrayBuffer], { type: 'application/epub+zip' });
         
-        // Clear file input and show books
+        // Save to IndexedDB
+        await epubDB.addBook(book, epubBlob);
+        
+        // Clear file input and refresh books list
         fileInput.value = '';
-        showBooksSection();
-        renderBooksList(books);
+        await loadBooks();
         
     } catch (error) {
         console.error('Error processing EPUB:', error);
@@ -88,11 +250,14 @@ async function handleUpload() {
         } else {
             alert('Error processing EPUB file. Please try another file.');
         }
+    } finally {
+        uploadBtn.disabled = false;
+        uploadBtn.textContent = 'Upload';
     }
 }
 
-// Parse EPUB structure with content extraction
-async function parseEpubWithContent(zip) {
+// Parse EPUB structure (metadata only, no content extraction during upload)
+async function parseEpubStructure(zip) {
     const opfPath = await findOpfPath(zip);
     const opfContent = await zip.file(opfPath).async('string');
     const parser = new DOMParser();
@@ -100,7 +265,7 @@ async function parseEpubWithContent(zip) {
     
     // Get title
     const titleElement = opfDoc.querySelector('metadata title');
-    const title = titleElement ? titleElement.textContent : 'Unknown Title';
+    const title = titleElement ? titleElement.textContent.trim() : 'Unknown Title';
     
     // Get spine items (reading order)
     const spine = opfDoc.querySelector('spine');
@@ -110,7 +275,7 @@ async function parseEpubWithContent(zip) {
     const manifest = opfDoc.querySelector('manifest');
     const items = manifest ? Array.from(manifest.querySelectorAll('item')) : [];
     
-    // Build chapters array with extracted content
+    // Build chapters array with just metadata
     const chapters = [];
     for (const itemref of itemrefs) {
         const idref = itemref.getAttribute('idref');
@@ -120,25 +285,90 @@ async function parseEpubWithContent(zip) {
             const href = item.getAttribute('href');
             const fullPath = opfPath.substring(0, opfPath.lastIndexOf('/') + 1) + href;
             
-            // Extract chapter title and content
+            // Try to get chapter title from content
             try {
                 const content = await zip.file(fullPath).async('string');
                 const contentDoc = parser.parseFromString(content, 'text/html');
-                const h1 = contentDoc.querySelector('h1, h2, h3, title');
-                const chapterTitle = h1 ? h1.textContent.trim() : `Chapter ${chapters.length + 1}`;
                 
-                // Extract text content immediately
-                const textContent = extractTextFromHtml(contentDoc.body);
+                // Try multiple selectors to find the chapter title
+                let chapterTitle = '';
+                
+                // First try heading tags in the body (skip title tag completely for now)
+                const bodyHeadings = contentDoc.querySelectorAll('body h1, body h2, body h3, body h4, body h5, body h6');
+                if (bodyHeadings.length > 0) {
+                    chapterTitle = bodyHeadings[0].textContent.trim();
+                }
+                
+                // If no body headings, try any headings
+                if (!chapterTitle) {
+                    const allHeadings = contentDoc.querySelectorAll('h1, h2, h3, h4, h5, h6');
+                    if (allHeadings.length > 0) {
+                        chapterTitle = allHeadings[0].textContent.trim();
+                    }
+                }
+                
+                // Try elements with common chapter title classes/attributes
+                if (!chapterTitle) {
+                    const titleSelectors = [
+                        '.chapter-title', '.chapter-heading', '.title',
+                        '[class*="chapter"]', '[class*="title"]',
+                        'div[style*="font-weight: bold"]', 'span[style*="font-weight: bold"]'
+                    ];
+                    
+                    for (const selector of titleSelectors) {
+                        const element = contentDoc.querySelector(selector);
+                        if (element && element.textContent.trim().length > 0 && element.textContent.trim().length < 100) {
+                            chapterTitle = element.textContent.trim();
+                            break;
+                        }
+                    }
+                }
+                
+                // If still no title, try first bold or strong element
+                if (!chapterTitle) {
+                    const boldElements = contentDoc.querySelectorAll('b, strong');
+                    for (const bold of boldElements) {
+                        const text = bold.textContent.trim();
+                        if (text.length > 0 && text.length < 100) {
+                            chapterTitle = text;
+                            break;
+                        }
+                    }
+                }
+                
+                // Skip title tag as it often contains book title + author
+                // Only use it as last resort and filter out common patterns
+                if (!chapterTitle) {
+                    const titleTag = contentDoc.querySelector('title');
+                    if (titleTag) {
+                        const titleText = titleTag.textContent.trim();
+                        // Skip if it looks like "Book Title - Author" or "Author - Book Title"
+                        if (!titleText.includes(' - ') && !titleText.includes(' by ') && titleText.length < 100) {
+                            chapterTitle = titleText;
+                        }
+                    }
+                }
+                
+                // Fallback to generic chapter name
+                if (!chapterTitle || chapterTitle.length === 0) {
+                    chapterTitle = `Chapter ${chapters.length + 1}`;
+                }
+                
+                // Clean up title (remove extra whitespace, limit length)
+                chapterTitle = chapterTitle.replace(/\s+/g, ' ').trim();
+                if (chapterTitle.length > 60) {
+                    chapterTitle = chapterTitle.substring(0, 57) + '...';
+                }
                 
                 chapters.push({
                     title: chapterTitle,
-                    content: textContent
+                    href: fullPath
                 });
             } catch (e) {
                 console.warn('Error processing chapter:', fullPath, e);
                 chapters.push({
                     title: `Chapter ${chapters.length + 1}`,
-                    content: 'Error loading chapter content.'
+                    href: fullPath
                 });
             }
         }
@@ -173,36 +403,41 @@ function renderBooksList(books) {
 
 // View book chapters
 async function viewBook(bookId) {
-    const books = getStoredBooks();
-    const book = books.find(b => b.id === bookId);
-    
-    if (!book) {
-        alert('Book not found');
-        return;
+    try {
+        const book = await epubDB.getBook(bookId);
+        
+        if (!book) {
+            alert('Book not found');
+            return;
+        }
+        
+        currentBook = book;
+        showChaptersSection(book);
+    } catch (error) {
+        console.error('Error loading book:', error);
+        alert('Error loading book');
     }
-    
-    currentBook = book;
-    showChaptersSection(book);
 }
 
 // Delete book
-function deleteBook(bookId) {
+async function deleteBook(bookId) {
     if (!confirm('Are you sure you want to delete this book?')) {
         return;
     }
     
-    const books = getStoredBooks();
-    const filteredBooks = books.filter(b => b.id !== bookId);
-    saveBooks(filteredBooks);
-    
-    // Remove EPUB data
-    localStorage.removeItem(`epub_${bookId}`);
-    
-    renderBooksList(filteredBooks);
-    
-    if (filteredBooks.length === 0) {
-        hideAllSections();
-        uploadSection.style.display = 'block';
+    try {
+        await epubDB.deleteBook(bookId);
+        await loadBooks();
+        
+        // Check if any books remain
+        const remainingBooks = await epubDB.getAllBooks();
+        if (remainingBooks.length === 0) {
+            hideAllSections();
+            uploadSection.style.display = 'block';
+        }
+    } catch (error) {
+        console.error('Error deleting book:', error);
+        alert('Error deleting book');
     }
 }
 
@@ -213,41 +448,83 @@ function showChaptersSection(book) {
     bookTitle.textContent = book.title;
     
     chaptersList.innerHTML = '';
+    
+    if (!book.chapters || book.chapters.length === 0) {
+        const li = document.createElement('li');
+        li.className = 'chapter-item';
+        li.innerHTML = '<span class="chapter-title">No chapters found</span>';
+        chaptersList.appendChild(li);
+        return;
+    }
+    
     book.chapters.forEach((chapter, index) => {
         const li = document.createElement('li');
         li.className = 'chapter-item';
+        
+        // Ensure chapter title is displayed properly
+        const chapterTitle = chapter.title || `Chapter ${index + 1}`;
+        
         li.innerHTML = `
-            <span class="chapter-title">${chapter.title}</span>
+            <span class="chapter-title">${escapeHtml(chapterTitle)}</span>
             <button class="btn btn-small" onclick="viewChapter('${book.id}', ${index})">View & Download</button>
         `;
         chaptersList.appendChild(li);
     });
 }
 
+// Helper function to escape HTML
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
 // View chapter content
-function viewChapter(bookId, chapterIndex) {
-    const books = getStoredBooks();
-    const book = books.find(b => b.id === bookId);
-    
-    if (!book) {
-        alert('Book not found');
-        return;
+async function viewChapter(bookId, chapterIndex) {
+    try {
+        const book = await epubDB.getBook(bookId);
+        
+        if (!book) {
+            alert('Book not found');
+            return;
+        }
+        
+        const chapter = book.chapters[chapterIndex];
+        if (!chapter) {
+            alert('Chapter not found');
+            return;
+        }
+        
+        // Load EPUB file and extract chapter content
+        const epubBlob = await epubDB.getEpubFile(bookId);
+        if (!epubBlob) {
+            alert('EPUB file not found');
+            return;
+        }
+        
+        const arrayBuffer = await epubBlob.arrayBuffer();
+        const zip = await JSZip.loadAsync(arrayBuffer);
+        
+        // Get chapter content
+        const content = await zip.file(chapter.href).async('string');
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(content, 'text/html');
+        
+        // Extract text content
+        const textContent = extractTextFromHtml(doc.body);
+        
+        currentChapterContent = textContent;
+        
+        // Show content
+        hideAllSections();
+        contentSection.style.display = 'block';
+        chapterTitle.textContent = chapter.title;
+        chapterContent.textContent = textContent;
+        
+    } catch (error) {
+        console.error('Error loading chapter:', error);
+        alert('Error loading chapter content');
     }
-    
-    const chapter = book.chapters[chapterIndex];
-    if (!chapter) {
-        alert('Chapter not found');
-        return;
-    }
-    
-    // Content is already extracted and stored
-    currentChapterContent = chapter.content;
-    
-    // Show content
-    hideAllSections();
-    contentSection.style.display = 'block';
-    chapterTitle.textContent = chapter.title;
-    chapterContent.textContent = chapter.content;
 }
 
 // Extract text from HTML
