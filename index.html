@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EPUB Chapter Extractor</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>EPUB Chapter Extractor</h1>
+        </header>
+        
+        <main>
+            <!-- File Upload Section -->
+            <section id="upload-section" class="card">
+                <h2>Upload EPUB</h2>
+                <input type="file" id="file-input" accept=".epub" />
+                <button id="upload-btn" class="btn btn-primary">Upload</button>
+            </section>
+            
+            <!-- Books List Section -->
+            <section id="books-section" class="card" style="display: none;">
+                <h2>My Books</h2>
+                <ul id="books-list" class="books-list"></ul>
+            </section>
+            
+            <!-- Chapter Navigation Section -->
+            <section id="chapters-section" class="card" style="display: none;">
+                <button id="back-to-books" class="btn btn-secondary">← Back to Books</button>
+                <h2 id="book-title"></h2>
+                <ul id="chapters-list" class="chapters-list"></ul>
+            </section>
+            
+            <!-- Chapter Content Section -->
+            <section id="content-section" class="card" style="display: none;">
+                <button id="back-to-chapters" class="btn btn-secondary">← Back to Chapters</button>
+                <h2 id="chapter-title"></h2>
+                <div id="chapter-content" class="chapter-content"></div>
+                <button id="download-btn" class="btn btn-primary">Download as .txt</button>
+            </section>
+        </main>
+    </div>
+    
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
