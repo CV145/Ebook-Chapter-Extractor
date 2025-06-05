@@ -133,6 +133,9 @@ const chapterTitle = document.getElementById('chapter-title');
 const chapterContent = document.getElementById('chapter-content');
 const downloadBtn = document.getElementById('download-btn');
 const downloadFullBookBtn = document.getElementById('download-full-book');
+const loadingIndicator = document.getElementById('loading-indicator');
+const progressFill = document.getElementById('progress-fill');
+const progressText = document.getElementById('progress-text');
 const backToBooks = document.getElementById('back-to-books');
 const backToChapters = document.getElementById('back-to-chapters');
 
@@ -519,6 +522,14 @@ function escapeHtml(text) {
 
 // View chapter content
 async function viewChapter(bookId, chapterIndex) {
+    // Show loading state immediately
+    const chapterButtons = document.querySelectorAll('.chapter-item button');
+    const clickedButton = chapterButtons[chapterIndex];
+    if (clickedButton) {
+        clickedButton.disabled = true;
+        clickedButton.textContent = 'Loading...';
+    }
+    
     try {
         const book = await epubDB.getBook(bookId);
         
@@ -562,6 +573,12 @@ async function viewChapter(bookId, chapterIndex) {
     } catch (error) {
         console.error('Error loading chapter:', error);
         alert('Error loading chapter content');
+    } finally {
+        // Reset button state
+        if (clickedButton) {
+            clickedButton.disabled = false;
+            clickedButton.textContent = 'View & Download';
+        }
     }
 }
 
@@ -610,6 +627,29 @@ function downloadChapter() {
     URL.revokeObjectURL(url);
 }
 
+// Show loading indicator
+function showLoadingIndicator(totalChapters) {
+    loadingIndicator.style.display = 'block';
+    progressFill.style.width = '0%';
+    progressText.textContent = `0 / ${totalChapters} chapters`;
+    downloadFullBookBtn.disabled = true;
+    downloadFullBookBtn.textContent = 'Processing...';
+}
+
+// Update loading progress
+function updateLoadingProgress(current, total) {
+    const percentage = (current / total) * 100;
+    progressFill.style.width = `${percentage}%`;
+    progressText.textContent = `${current} / ${total} chapters`;
+}
+
+// Hide loading indicator
+function hideLoadingIndicator() {
+    loadingIndicator.style.display = 'none';
+    downloadFullBookBtn.disabled = false;
+    downloadFullBookBtn.textContent = 'Download Full Book as .txt';
+}
+
 // Download entire book as .txt
 async function downloadFullBook() {
     if (!currentBook) {
@@ -617,8 +657,8 @@ async function downloadFullBook() {
         return;
     }
     
-    downloadFullBookBtn.disabled = true;
-    downloadFullBookBtn.textContent = 'Processing...';
+    const totalChapters = currentBook.chapters.length;
+    showLoadingIndicator(totalChapters);
     
     try {
         // Load EPUB file
@@ -638,6 +678,9 @@ async function downloadFullBook() {
         
         for (let i = 0; i < currentBook.chapters.length; i++) {
             const chapter = currentBook.chapters[i];
+            
+            // Update progress
+            updateLoadingProgress(i, totalChapters);
             
             try {
                 // Get chapter content
@@ -662,7 +705,13 @@ async function downloadFullBook() {
                 fullBookText += `\n\n--- ${chapter.title} ---\n\n`;
                 fullBookText += '[Error loading chapter content]';
             }
+            
+            // Allow UI to update between chapters (important for mobile)
+            await new Promise(resolve => setTimeout(resolve, 10));
         }
+        
+        // Final progress update
+        updateLoadingProgress(totalChapters, totalChapters);
         
         // Create and download file
         const fileName = `${currentBook.title.replace(/[^a-z0-9]/gi, '_')}_complete.txt`;
@@ -681,8 +730,7 @@ async function downloadFullBook() {
         console.error('Error downloading full book:', error);
         alert('Error downloading full book');
     } finally {
-        downloadFullBookBtn.disabled = false;
-        downloadFullBookBtn.textContent = 'Download Full Book as .txt';
+        hideLoadingIndicator();
     }
 }
 

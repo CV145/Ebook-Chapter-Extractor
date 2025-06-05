@@ -33,6 +33,19 @@
                 <div class="book-actions">
                     <button id="download-full-book" class="btn btn-primary">Download Full Book as .txt</button>
                 </div>
+                
+                <!-- Loading indicator -->
+                <div id="loading-indicator" class="loading-indicator" style="display: none;">
+                    <div class="loading-spinner"></div>
+                    <div class="loading-text">Processing chapters...</div>
+                    <div class="loading-progress">
+                        <div class="progress-bar">
+                            <div id="progress-fill" class="progress-fill"></div>
+                        </div>
+                        <div id="progress-text" class="progress-text">0 / 0 chapters</div>
+                    </div>
+                </div>
+                
                 <ul id="chapters-list" class="chapters-list"></ul>
             </section>
             
