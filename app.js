@@ -292,59 +292,91 @@ async function parseEpubStructure(zip) {
                 
                 // Try multiple selectors to find the chapter title
                 let chapterTitle = '';
+                let debugInfo = [];
                 
-                // First try heading tags in the body (skip title tag completely for now)
-                const bodyHeadings = contentDoc.querySelectorAll('body h1, body h2, body h3, body h4, body h5, body h6');
+                // Method 1: Try heading tags in body first (more compatible approach)
+                const body = contentDoc.querySelector('body') || contentDoc;
+                const bodyHeadings = body.querySelectorAll('h1, h2, h3, h4, h5, h6');
                 if (bodyHeadings.length > 0) {
                     chapterTitle = bodyHeadings[0].textContent.trim();
+                    debugInfo.push(`Found body heading: "${chapterTitle}"`);
                 }
                 
-                // If no body headings, try any headings
+                // Method 2: If no body headings, try any headings (fallback for mobile)
                 if (!chapterTitle) {
                     const allHeadings = contentDoc.querySelectorAll('h1, h2, h3, h4, h5, h6');
                     if (allHeadings.length > 0) {
                         chapterTitle = allHeadings[0].textContent.trim();
+                        debugInfo.push(`Found any heading: "${chapterTitle}"`);
                     }
                 }
                 
-                // Try elements with common chapter title classes/attributes
+                // Method 3: Try simple class-based selectors (mobile-friendly)
                 if (!chapterTitle) {
-                    const titleSelectors = [
-                        '.chapter-title', '.chapter-heading', '.title',
-                        '[class*="chapter"]', '[class*="title"]',
-                        'div[style*="font-weight: bold"]', 'span[style*="font-weight: bold"]'
-                    ];
-                    
-                    for (const selector of titleSelectors) {
-                        const element = contentDoc.querySelector(selector);
-                        if (element && element.textContent.trim().length > 0 && element.textContent.trim().length < 100) {
-                            chapterTitle = element.textContent.trim();
+                    const simpleSelectors = ['h1', 'h2', 'h3'];
+                    for (const selector of simpleSelectors) {
+                        const elements = contentDoc.getElementsByTagName(selector);
+                        if (elements.length > 0) {
+                            chapterTitle = elements[0].textContent.trim();
+                            debugInfo.push(`Found ${selector}: "${chapterTitle}"`);
                             break;
                         }
                     }
                 }
                 
-                // If still no title, try first bold or strong element
+                // Method 4: Try elements with common chapter classes (simplified for mobile)
                 if (!chapterTitle) {
-                    const boldElements = contentDoc.querySelectorAll('b, strong');
-                    for (const bold of boldElements) {
-                        const text = bold.textContent.trim();
-                        if (text.length > 0 && text.length < 100) {
-                            chapterTitle = text;
+                    const commonClasses = ['chapter-title', 'chapter-heading', 'title'];
+                    for (const className of commonClasses) {
+                        const elements = contentDoc.getElementsByClassName(className);
+                        if (elements.length > 0 && elements[0].textContent.trim().length > 0) {
+                            chapterTitle = elements[0].textContent.trim();
+                            debugInfo.push(`Found class ${className}: "${chapterTitle}"`);
                             break;
                         }
                     }
                 }
                 
-                // Skip title tag as it often contains book title + author
-                // Only use it as last resort and filter out common patterns
+                // Method 5: Try bold elements (getElementsByTagName is more mobile-compatible)
                 if (!chapterTitle) {
-                    const titleTag = contentDoc.querySelector('title');
-                    if (titleTag) {
-                        const titleText = titleTag.textContent.trim();
-                        // Skip if it looks like "Book Title - Author" or "Author - Book Title"
-                        if (!titleText.includes(' - ') && !titleText.includes(' by ') && titleText.length < 100) {
+                    const boldTags = ['b', 'strong'];
+                    for (const tag of boldTags) {
+                        const elements = contentDoc.getElementsByTagName(tag);
+                        for (let i = 0; i < elements.length; i++) {
+                            const text = elements[i].textContent.trim();
+                            if (text.length > 0 && text.length < 100 && !text.includes(' - ')) {
+                                chapterTitle = text;
+                                debugInfo.push(`Found ${tag}: "${chapterTitle}"`);
+                                break;
+                            }
+                        }
+                        if (chapterTitle) break;
+                    }
+                }
+                
+                // Method 6: Parse filename for chapter info
+                if (!chapterTitle) {
+                    const filename = fullPath.split('/').pop().replace(/\.(xhtml|html)$/, '');
+                    if (filename.match(/chapter|ch\d+|part/i)) {
+                        chapterTitle = filename.replace(/[-_]/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+                        debugInfo.push(`From filename: "${chapterTitle}"`);
+                    }
+                }
+                
+                // Method 7: Title tag as last resort with better filtering
+                if (!chapterTitle) {
+                    const titleElements = contentDoc.getElementsByTagName('title');
+                    if (titleElements.length > 0) {
+                        const titleText = titleElements[0].textContent.trim();
+                        // Better filtering for mobile browsers
+                        const skipPatterns = [' - ', ' by ', '|', ':', 'author'];
+                        const shouldSkip = skipPatterns.some(pattern => 
+                            titleText.toLowerCase().includes(pattern.toLowerCase())
+                        );
+                        
+                        if (!shouldSkip && titleText.length < 100) {
                             chapterTitle = titleText;
+                            debugInfo.push(`From title tag: "${chapterTitle}"`);
                         }
                     }
                 }
@@ -352,6 +384,7 @@ async function parseEpubStructure(zip) {
                 // Fallback to generic chapter name
                 if (!chapterTitle || chapterTitle.length === 0) {
                     chapterTitle = `Chapter ${chapters.length + 1}`;
+                    debugInfo.push(`Fallback: "${chapterTitle}"`);
                 }
                 
                 // Clean up title (remove extra whitespace, limit length)
@@ -359,6 +392,9 @@ async function parseEpubStructure(zip) {
                 if (chapterTitle.length > 60) {
                     chapterTitle = chapterTitle.substring(0, 57) + '...';
                 }
+                
+                // Log debug info for mobile troubleshooting
+                console.log(`Chapter ${chapters.length + 1} extraction:`, debugInfo);
                 
                 chapters.push({
                     title: chapterTitle,
