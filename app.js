@@ -351,6 +351,16 @@ class PDFParser {
             const textContent = await tocPage.getTextContent();
             const items = textContent.items;
             
+            // First, try to get clickable links from the TOC page
+            const annotations = await tocPage.getAnnotations();
+            const linkAnnotations = annotations.filter(ann => ann.subtype === 'Link' && ann.dest);
+            
+            console.log(`Found ${linkAnnotations.length} clickable links on TOC page`);
+            
+            if (linkAnnotations.length > 0) {
+                return await this.extractChaptersFromTOCLinks(pdf, linkAnnotations, numPages, tocPageNum);
+            }
+            
             // Group items by Y position (same line)
             const lines = [];
             let currentLine = [];
@@ -406,7 +416,8 @@ class PDFParser {
                     if (title.length > 2 && !title.match(/^\d+$/)) {
                         tocEntries.push({
                             title: title,
-                            pageNum: pageNum
+                            tocPageNum: pageNum,  // Page number shown in TOC
+                            pageNum: pageNum      // Will be adjusted later
                         });
                     }
                 }
@@ -438,15 +449,65 @@ class PDFParser {
                 }));
             }
             
-            // Create chapter objects with proper page ranges
+            // Calculate page offset by finding the first few chapters
+            console.log('Calculating page number offset...');
+            let pageOffset = 0;
+            const offsetSamples = [];
+            
+            // Try to find the first few chapters to calculate offset
+            for (let i = 0; i < Math.min(3, mainChapters.length); i++) {
+                const entry = mainChapters[i];
+                
+                // Search for the chapter title in the PDF
+                // Typically the actual page is after the TOC page
+                const searchStart = Math.max(tocPageNum, entry.tocPageNum - 5);
+                const searchEnd = Math.min(numPages, entry.tocPageNum + 50);
+                
+                for (let pageNum = searchStart; pageNum <= searchEnd; pageNum++) {
+                    try {
+                        const page = await pdf.getPage(pageNum);
+                        const textContent = await page.getTextContent();
+                        
+                        // Get first few text items (usually chapter headings)
+                        const firstTexts = textContent.items.slice(0, 10).map(item => item.str).join(' ');
+                        
+                        // Check if this page starts with the chapter title
+                        const cleanTitle = entry.title.toLowerCase().replace(/[^\w\s]/g, '').trim();
+                        const cleanPageText = firstTexts.toLowerCase().replace(/[^\w\s]/g, '');
+                        
+                        if (cleanPageText.includes(cleanTitle)) {
+                            const offset = pageNum - entry.tocPageNum;
+                            offsetSamples.push(offset);
+                            console.log(`Found "${entry.title}" on PDF page ${pageNum} (TOC page ${entry.tocPageNum}) - offset: ${offset}`);
+                            break;
+                        }
+                    } catch (error) {
+                        console.warn(`Error searching page ${pageNum}:`, error);
+                    }
+                }
+            }
+            
+            // Calculate average offset
+            if (offsetSamples.length > 0) {
+                pageOffset = Math.round(offsetSamples.reduce((a, b) => a + b) / offsetSamples.length);
+                console.log(`Detected page offset: ${pageOffset} (TOC page + ${pageOffset} = actual PDF page)`);
+            } else {
+                console.warn('Could not detect page offset, using TOC page numbers as-is');
+            }
+            
+            // Create chapter objects with corrected page ranges
             for (let i = 0; i < mainChapters.length; i++) {
                 const entry = mainChapters[i];
                 const nextEntry = mainChapters[i + 1];
                 
+                // Apply the offset to get actual PDF pages
+                const actualStartPage = entry.tocPageNum + pageOffset;
+                const actualEndPage = nextEntry ? (nextEntry.tocPageNum + pageOffset - 1) : numPages;
+                
                 chapters.push({
                     title: entry.title,
-                    startPage: entry.pageNum,
-                    endPage: nextEntry ? nextEntry.pageNum - 1 : numPages,
+                    startPage: actualStartPage,
+                    endPage: actualEndPage,
                     type: 'pdf-chapter'
                 });
             }
@@ -460,6 +521,194 @@ class PDFParser {
         } catch (error) {
             console.error('Error extracting chapters from TOC:', error);
             return null;
+        }
+    }
+    
+    static async extractChaptersFromTOCLinks(pdf, linkAnnotations, numPages, tocPageNum) {
+        const chapters = [];
+        const linkDestinations = [];
+        
+        try {
+            console.log(`Starting to process ${linkAnnotations.length} link annotations`);
+            
+            // Get the destination page for each link
+            for (let i = 0; i < linkAnnotations.length; i++) {
+                const annotation = linkAnnotations[i];
+                console.log(`Processing link ${i + 1}/${linkAnnotations.length}:`, {
+                    dest: annotation.dest,
+                    rect: annotation.rect,
+                    url: annotation.url
+                });
+                
+                try {
+                    let pageIndex;
+                    
+                    // Handle different destination formats
+                    if (annotation.dest) {
+                        if (typeof annotation.dest === 'string') {
+                            console.log(`Link ${i + 1}: Named destination "${annotation.dest}"`);
+                            const destination = await pdf.getDestination(annotation.dest);
+                            console.log(`Destination resolved to:`, destination);
+                            if (destination && destination[0]) {
+                                pageIndex = await pdf.getPageIndex(destination[0]);
+                            }
+                        } else if (Array.isArray(annotation.dest) && annotation.dest[0]) {
+                            console.log(`Link ${i + 1}: Direct destination array`);
+                            pageIndex = await pdf.getPageIndex(annotation.dest[0]);
+                        }
+                    } else if (annotation.url && annotation.url.startsWith('#')) {
+                        // Handle internal URL links like "#page=5"
+                        console.log(`Link ${i + 1}: Internal URL "${annotation.url}"`);
+                        const pageMatch = annotation.url.match(/#page=(\d+)/);
+                        if (pageMatch) {
+                            pageIndex = parseInt(pageMatch[1]) - 1; // Convert to 0-based index
+                        }
+                    }
+                    
+                    if (pageIndex !== undefined) {
+                        const pageNum = pageIndex + 1;
+                        console.log(`Link ${i + 1}: Points to page ${pageNum}`);
+                        
+                        // Get the text content around this link to extract the chapter title
+                        const rect = annotation.rect;
+                        const linkText = await this.getTextNearRect(pdf, tocPageNum, rect);
+                        
+                        console.log(`Link ${i + 1}: Text extracted: "${linkText}"`);
+                        
+                        // If we can't extract good text, create a generic title
+                        let finalTitle = linkText;
+                        if (!finalTitle || finalTitle.length < 2) {
+                            finalTitle = `Section ${linkDestinations.length + 1}`;
+                            console.log(`Link ${i + 1}: Using generic title "${finalTitle}"`);
+                        }
+                        
+                        linkDestinations.push({
+                            title: finalTitle,
+                            pageNum: pageNum,
+                            rect: rect
+                        });
+                        console.log(`Link ${i + 1}: Added to destinations as "${finalTitle}"`);
+                    } else {
+                        console.warn(`Link ${i + 1}: Could not determine page index`);
+                    }
+                } catch (error) {
+                    console.warn(`Error processing link ${i + 1}:`, error);
+                }
+            }
+            
+            console.log(`FINAL: linkDestinations array has ${linkDestinations.length} items:`, linkDestinations);
+            
+            // Sort by page number
+            linkDestinations.sort((a, b) => a.pageNum - b.pageNum);
+            
+            // Remove duplicates but keep all sections
+            const allChapters = [];
+            const seenPageNums = new Set();
+            
+            console.log('All link destinations found:', linkDestinations);
+            
+            for (const dest of linkDestinations) {
+                // Skip if we already have this exact page
+                if (seenPageNums.has(dest.pageNum)) continue;
+                seenPageNums.add(dest.pageNum);
+                
+                // Skip if title is too short or just whitespace
+                if (!dest.title || dest.title.length < 2) continue;
+                
+                allChapters.push(dest);
+            }
+            
+            // Sort by page number to ensure proper order
+            allChapters.sort((a, b) => a.pageNum - b.pageNum);
+            
+            // Create chapter objects with page ranges from ALL links
+            for (let i = 0; i < allChapters.length; i++) {
+                const chapter = allChapters[i];
+                const nextChapter = allChapters[i + 1];
+                
+                chapters.push({
+                    title: chapter.title,
+                    startPage: chapter.pageNum,
+                    endPage: nextChapter ? nextChapter.pageNum - 1 : numPages,
+                    type: 'pdf-chapter'
+                });
+                
+                console.log(`Chapter: "${chapter.title}" - Pages ${chapter.pageNum} to ${nextChapter ? nextChapter.pageNum - 1 : numPages}`);
+            }
+            
+            if (chapters.length > 0) {
+                console.log(`SUCCESS: Extracted ${chapters.length} chapters from TOC links`);
+                console.log('Final chapters array:', chapters);
+                return chapters;
+            } else {
+                console.warn('No chapters created from TOC links - falling back');
+            }
+            
+        } catch (error) {
+            console.error('ERROR in extractChaptersFromTOCLinks:', error);
+            console.error('Stack trace:', error.stack);
+        }
+        
+        console.log('Returning null from extractChaptersFromTOCLinks');
+        return null;
+    }
+    
+    static async getTextNearRect(pdf, pageNum, rect) {
+        try {
+            const page = await pdf.getPage(pageNum);
+            const textContent = await page.getTextContent();
+            
+            // Find text items that overlap with the link rectangle
+            const [x1, y1, x2, y2] = rect;
+            const linkTexts = [];
+            
+            console.log(`Searching for text near rect [${x1}, ${y1}, ${x2}, ${y2}] on page ${pageNum}`);
+            
+            // Try broader search area
+            const margin = 50; // Increase search margin
+            
+            for (const item of textContent.items) {
+                const itemX = item.transform[4];
+                const itemY = item.transform[5];
+                const itemHeight = item.height || 10;
+                
+                // Check if text item is near the link rectangle (more generous bounds)
+                if (itemX >= x1 - margin && itemX <= x2 + margin && 
+                    itemY >= y1 - margin && itemY <= y2 + margin) {
+                    if (item.str.trim()) {
+                        linkTexts.push(item.str.trim());
+                        console.log(`Found text near link: "${item.str.trim()}" at [${itemX}, ${itemY}]`);
+                    }
+                }
+            }
+            
+            // Join and clean up the text
+            let fullText = linkTexts.join(' ').trim();
+            
+            // If still no text found, try getting text from the entire line
+            if (!fullText && textContent.items.length > 0) {
+                // Group items by Y position to find text on same line as link
+                const centerY = (y1 + y2) / 2;
+                const lineItems = textContent.items.filter(item => {
+                    const itemY = item.transform[5];
+                    return Math.abs(itemY - centerY) < 20;
+                });
+                
+                if (lineItems.length > 0) {
+                    fullText = lineItems.map(item => item.str).join(' ').trim();
+                    console.log(`Found text on same line: "${fullText}"`);
+                }
+            }
+            
+            // Remove page numbers from the end
+            fullText = fullText.replace(/\s+\d+\s*$/, '').replace(/\.+$/, '').trim();
+            
+            console.log(`Final extracted text: "${fullText}"`);
+            return fullText;
+            
+        } catch (error) {
+            console.warn('Error getting text near rect:', error);
+            return '';
         }
     }
     
