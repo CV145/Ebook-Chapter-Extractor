@@ -144,9 +144,15 @@ class PDFParser {
             // Try to extract real chapters from PDF structure
             let chapters = await this.extractChaptersFromOutline(pdf);
             
-            // If no outline found, try to detect chapters from content
+            // If no outline found, try to extract from TOC page
             if (!chapters || chapters.length === 0) {
-                console.log('No PDF outline found, detecting chapters from content...');
+                console.log('No PDF outline found, looking for Table of Contents page...');
+                chapters = await this.extractChaptersFromTOC(pdf, numPages);
+            }
+            
+            // If no TOC found, try to detect chapters from content
+            if (!chapters || chapters.length === 0) {
+                console.log('No TOC found, detecting chapters from content...');
                 chapters = await this.detectChaptersFromContent(pdf, numPages);
             }
             
@@ -174,7 +180,7 @@ class PDFParser {
             const allOutlineItems = [];
             
             // Flatten the outline structure (handle nested items)
-            const flattenOutline = async (items, level = 0) => {
+            const flattenOutline = async (items, level = 0, parentTitle = '') => {
                 for (const item of items) {
                     if (item.dest) {
                         try {
@@ -184,7 +190,8 @@ class PDFParser {
                                 allOutlineItems.push({
                                     title: item.title,
                                     pageNumber: pageIndex + 1,
-                                    level: level
+                                    level: level,
+                                    parentTitle: parentTitle
                                 });
                             }
                         } catch (e) {
@@ -194,7 +201,7 @@ class PDFParser {
                     
                     // Process nested items
                     if (item.items && item.items.length > 0) {
-                        await flattenOutline(item.items, level + 1);
+                        await flattenOutline(item.items, level + 1, item.title);
                     }
                 }
             };
@@ -205,17 +212,100 @@ class PDFParser {
             // Sort by page number
             allOutlineItems.sort((a, b) => a.pageNumber - b.pageNumber);
             
-            // Create chapters from flattened outline
+            console.log('All outline items:', allOutlineItems.map(item => 
+                `${item.title} (level ${item.level}, page ${item.pageNumber})`
+            ));
+            
+            // First, identify what constitutes a main chapter vs subsection
+            // Look for common patterns across all items
+            const hasNumericChapters = allOutlineItems.some(item => 
+                item.title.match(/^(Chapter|CHAPTER)\s+\d+/i)
+            );
+            
+            const hasNumericSections = allOutlineItems.some(item => 
+                item.title.match(/^\d+\.\d+/)
+            );
+            
+            // Group items by main chapters
+            const mainChapters = [];
+            
             for (let i = 0; i < allOutlineItems.length; i++) {
                 const item = allOutlineItems[i];
-                const nextItem = allOutlineItems[i + 1];
+                let isMainChapter = false;
+                
+                // Determine if this is a main chapter
+                if (hasNumericChapters) {
+                    // If we have "Chapter X" format, only those are main chapters
+                    isMainChapter = item.title.match(/^(Chapter|CHAPTER)\s+\d+/i) !== null;
+                } else if (hasNumericSections) {
+                    // If we have numeric sections, main chapters are those without dots
+                    isMainChapter = item.level === 0 || 
+                        (item.title.match(/^\d+\.?\s/) && !item.title.match(/^\d+\.\d+/));
+                } else {
+                    // Otherwise, use level 0 items as main chapters
+                    isMainChapter = item.level === 0;
+                }
+                
+                // Also include common book sections as main chapters
+                const isSpecialSection = item.title.match(
+                    /^(Introduction|Conclusion|Preface|Epilogue|Appendix|Bibliography|References|Index|Foreword|Acknowledgments)$/i
+                );
+                
+                if (isMainChapter || isSpecialSection) {
+                    // Find where this chapter ends
+                    let endPage = pdf.numPages;
+                    
+                    // Look for the next main chapter
+                    for (let j = i + 1; j < allOutlineItems.length; j++) {
+                        const nextItem = allOutlineItems[j];
+                        let isNextMainChapter = false;
+                        
+                        if (hasNumericChapters) {
+                            isNextMainChapter = nextItem.title.match(/^(Chapter|CHAPTER)\s+\d+/i) !== null;
+                        } else if (hasNumericSections) {
+                            isNextMainChapter = nextItem.level === 0 || 
+                                (nextItem.title.match(/^\d+\.?\s/) && !nextItem.title.match(/^\d+\.\d+/));
+                        } else {
+                            isNextMainChapter = nextItem.level === 0;
+                        }
+                        
+                        const isNextSpecialSection = nextItem.title.match(
+                            /^(Introduction|Conclusion|Preface|Epilogue|Appendix|Bibliography|References|Index|Foreword|Acknowledgments)$/i
+                        );
+                        
+                        if (isNextMainChapter || isNextSpecialSection) {
+                            endPage = nextItem.pageNumber - 1;
+                            break;
+                        }
+                    }
+                    
+                    mainChapters.push({
+                        title: item.title,
+                        startPage: item.pageNumber,
+                        endPage: endPage,
+                        type: 'pdf-chapter'
+                    });
+                }
+            }
+            
+            // If we found main chapters, return them
+            if (mainChapters.length > 0) {
+                console.log(`Found ${mainChapters.length} main chapters from outline`);
+                return mainChapters;
+            }
+            
+            // Otherwise, return all level-0 items
+            console.log('No clear chapter structure found, using all top-level items');
+            const level0Items = allOutlineItems.filter(item => item.level === 0);
+            for (let i = 0; i < level0Items.length; i++) {
+                const item = level0Items[i];
+                const nextItem = level0Items[i + 1];
                 
                 chapters.push({
                     title: item.title,
                     startPage: item.pageNumber,
                     endPage: nextItem ? nextItem.pageNumber - 1 : pdf.numPages,
-                    type: 'pdf-chapter',
-                    level: item.level
+                    type: 'pdf-chapter'
                 });
             }
             
@@ -226,19 +316,170 @@ class PDFParser {
         }
     }
     
+    static async extractChaptersFromTOC(pdf, numPages) {
+        const chapters = [];
+        let tocPageNum = null;
+        
+        // First, find the TOC page
+        for (let pageNum = 1; pageNum <= Math.min(20, numPages); pageNum++) {
+            try {
+                const page = await pdf.getPage(pageNum);
+                const textContent = await page.getTextContent();
+                const pageText = textContent.items.map(item => item.str).join(' ').toLowerCase();
+                
+                // Look for TOC indicators
+                if (pageText.includes('table of contents') || 
+                    pageText.includes('contents') || 
+                    pageText.includes('índice') ||
+                    pageText.match(/^\s*contents\s*$/)) {
+                    tocPageNum = pageNum;
+                    console.log(`Found TOC on page ${pageNum}`);
+                    break;
+                }
+            } catch (error) {
+                console.warn(`Error checking page ${pageNum} for TOC:`, error);
+            }
+        }
+        
+        if (!tocPageNum) {
+            return null;
+        }
+        
+        // Extract chapters from TOC
+        try {
+            const tocPage = await pdf.getPage(tocPageNum);
+            const textContent = await tocPage.getTextContent();
+            const items = textContent.items;
+            
+            // Group items by Y position (same line)
+            const lines = [];
+            let currentLine = [];
+            let lastY = null;
+            
+            for (const item of items) {
+                const y = Math.round(item.transform[5]);
+                
+                if (lastY !== null && Math.abs(y - lastY) > 5) {
+                    // New line
+                    if (currentLine.length > 0) {
+                        lines.push({
+                            y: lastY,
+                            text: currentLine.map(i => i.str).join(' ').trim(),
+                            items: currentLine
+                        });
+                    }
+                    currentLine = [item];
+                } else {
+                    currentLine.push(item);
+                }
+                lastY = y;
+            }
+            
+            // Add last line
+            if (currentLine.length > 0) {
+                lines.push({
+                    y: lastY,
+                    text: currentLine.map(i => i.str).join(' ').trim(),
+                    items: currentLine
+                });
+            }
+            
+            // Parse TOC entries
+            const tocEntries = [];
+            const pageNumberPattern = /\.{3,}|\s{3,}|\s+(\d+)\s*$/;
+            
+            for (const line of lines) {
+                const text = line.text;
+                
+                // Skip empty lines or TOC header
+                if (!text || text.toLowerCase().includes('table of contents')) {
+                    continue;
+                }
+                
+                // Look for page numbers at the end
+                const pageMatch = text.match(/(\d+)\s*$/);
+                if (pageMatch) {
+                    const pageNum = parseInt(pageMatch[1]);
+                    const title = text.substring(0, pageMatch.index).replace(/\.+$/, '').trim();
+                    
+                    // Skip if title is too short or looks like a page number itself
+                    if (title.length > 2 && !title.match(/^\d+$/)) {
+                        tocEntries.push({
+                            title: title,
+                            pageNum: pageNum
+                        });
+                    }
+                }
+            }
+            
+            // Log all found entries for debugging
+            console.log('All TOC entries found:', tocEntries);
+            
+            // Filter to main chapters only (no subsections)
+            const mainChapters = tocEntries.filter(entry => {
+                // Skip subsections like "1.1", "2.3.4"
+                if (entry.title.match(/^\d+\.\d+/)) return false;
+                
+                // Skip if it's just a number
+                if (entry.title.match(/^\d+$/)) return false;
+                
+                // Keep everything else as potential chapters
+                return true;
+            });
+            
+            // If too few main chapters, be less restrictive
+            if (mainChapters.length < 3) {
+                console.log('Too few main chapters found, using all TOC entries');
+                return tocEntries.map((entry, i) => ({
+                    title: entry.title,
+                    startPage: entry.pageNum,
+                    endPage: tocEntries[i + 1] ? tocEntries[i + 1].pageNum - 1 : numPages,
+                    type: 'pdf-chapter'
+                }));
+            }
+            
+            // Create chapter objects with proper page ranges
+            for (let i = 0; i < mainChapters.length; i++) {
+                const entry = mainChapters[i];
+                const nextEntry = mainChapters[i + 1];
+                
+                chapters.push({
+                    title: entry.title,
+                    startPage: entry.pageNum,
+                    endPage: nextEntry ? nextEntry.pageNum - 1 : numPages,
+                    type: 'pdf-chapter'
+                });
+            }
+            
+            if (chapters.length > 0) {
+                console.log(`Extracted ${chapters.length} chapters from TOC`);
+            }
+            
+            return chapters;
+            
+        } catch (error) {
+            console.error('Error extracting chapters from TOC:', error);
+            return null;
+        }
+    }
+    
     static async detectChaptersFromContent(pdf, numPages) {
         const chapters = [];
-        const chapterPatterns = [
-            /^(Chapter|CHAPTER|Chap\.?)\s+(\d+|[IVXLCDM]+)/,
-            /^(Section|SECTION|Sec\.?)\s+(\d+|[IVXLCDM]+)/,
-            /^(Part|PART)\s+(\d+|[IVXLCDM]+)/,
-            /^(\d+)\.\s+\w+/,  // "1. Introduction"
-            /^(Introduction|Conclusion|Preface|Epilogue|Appendix|Bibliography|References|Index)/i,
-            /^(Foreword|Acknowledgments|Dedication|Abstract|Summary)/i
+        const mainChapterPatterns = [
+            /^(Chapter|CHAPTER|Chap\.?)\s+(\d+|[IVXLCDM]+)(?:\s|:|$)/,
+            /^(Part|PART)\s+(\d+|[IVXLCDM]+)(?:\s|:|$)/,
+            /^(\d+)\.(?:\s+\w+|$)/,  // "1. Introduction" or just "1."
+            /^(Introduction|Conclusion|Preface|Epilogue|Appendix|Bibliography|References|Index)$/i,
+            /^(Foreword|Acknowledgments|Dedication|Abstract|Summary)$/i
         ];
         
-        let currentChapter = null;
+        const subsectionPatterns = [
+            /^\d+\.\d+/,  // "1.1", "2.3", etc.
+            /^(Section|SECTION|Sec\.?)\s+\d+\.\d+/
+        ];
+        
         const potentialChapters = [];
+        const seenChapters = new Map(); // Track chapter numbers to avoid duplicates
         
         // First pass: collect all potential chapter headings
         for (let pageNum = 1; pageNum <= numPages; pageNum++) {
@@ -262,23 +503,43 @@ class PDFParser {
                     }
                 }
                 
-                // Check combined text for patterns
+                // Skip if this looks like a subsection
                 const combinedText = pageText.trim();
-                for (const pattern of chapterPatterns) {
-                    const match = combinedText.match(pattern);
-                    if (match) {
-                        // Look for the item with largest font size (likely the heading)
-                        const largestItem = firstItems.reduce((prev, current) => 
-                            (current.fontSize > prev.fontSize) ? current : prev
-                        );
-                        
-                        potentialChapters.push({
-                            title: match[0],
-                            pageNum: pageNum,
-                            fontSize: largestItem.fontSize,
-                            confidence: largestItem.fontSize > 12 ? 'high' : 'medium'
-                        });
+                let isSubsection = false;
+                for (const pattern of subsectionPatterns) {
+                    if (pattern.test(combinedText)) {
+                        isSubsection = true;
                         break;
+                    }
+                }
+                
+                if (!isSubsection) {
+                    // Check for main chapter patterns
+                    for (const pattern of mainChapterPatterns) {
+                        const match = combinedText.match(pattern);
+                        if (match) {
+                            // Extract chapter number if present
+                            const chapterNumMatch = match[0].match(/(\d+|[IVXLCDM]+)/);
+                            const chapterNum = chapterNumMatch ? chapterNumMatch[0] : match[0];
+                            
+                            // Check if we've already seen this chapter
+                            if (!seenChapters.has(chapterNum)) {
+                                seenChapters.set(chapterNum, true);
+                                
+                                const largestItem = firstItems.length > 0 ? 
+                                    firstItems.reduce((prev, current) => 
+                                        (current.fontSize > prev.fontSize) ? current : prev
+                                    ) : { fontSize: 12 };
+                                
+                                potentialChapters.push({
+                                    title: match[0],
+                                    pageNum: pageNum,
+                                    fontSize: largestItem.fontSize,
+                                    chapterNum: chapterNum
+                                });
+                            }
+                            break;
+                        }
                     }
                 }
             } catch (error) {
@@ -286,30 +547,17 @@ class PDFParser {
             }
         }
         
-        // Second pass: filter chapters based on consistency
-        if (potentialChapters.length > 0) {
-            // Find the most common font size for chapters
-            const fontSizes = potentialChapters.map(ch => ch.fontSize);
-            const avgFontSize = fontSizes.reduce((a, b) => a + b) / fontSizes.length;
+        // Create final chapter list with proper page ranges
+        for (let i = 0; i < potentialChapters.length; i++) {
+            const chapter = potentialChapters[i];
+            const nextChapter = potentialChapters[i + 1];
             
-            // Keep chapters with similar font sizes or high confidence
-            const validChapters = potentialChapters.filter(ch => 
-                ch.confidence === 'high' || 
-                Math.abs(ch.fontSize - avgFontSize) < 2
-            );
-            
-            // Create final chapter list
-            for (let i = 0; i < validChapters.length; i++) {
-                const chapter = validChapters[i];
-                const nextChapter = validChapters[i + 1];
-                
-                chapters.push({
-                    title: chapter.title,
-                    startPage: chapter.pageNum,
-                    endPage: nextChapter ? nextChapter.pageNum - 1 : numPages,
-                    type: 'pdf-chapter'
-                });
-            }
+            chapters.push({
+                title: chapter.title,
+                startPage: chapter.pageNum,
+                endPage: nextChapter ? nextChapter.pageNum - 1 : numPages,
+                type: 'pdf-chapter'
+            });
         }
         
         return chapters;
