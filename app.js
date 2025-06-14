@@ -664,44 +664,64 @@ class PDFParser {
             
             console.log(`Searching for text near rect [${x1}, ${y1}, ${x2}, ${y2}] on page ${pageNum}`);
             
-            // Try broader search area
-            const margin = 50; // Increase search margin
+            // Use tight bounds for link rectangle - only get text directly under the link
+            const margin = 5; // Much smaller margin for precision
             
             for (const item of textContent.items) {
                 const itemX = item.transform[4];
                 const itemY = item.transform[5];
+                const itemWidth = item.width || 0;
                 const itemHeight = item.height || 10;
                 
-                // Check if text item is near the link rectangle (more generous bounds)
+                // Check if text item overlaps with the link rectangle (tight bounds)
                 if (itemX >= x1 - margin && itemX <= x2 + margin && 
                     itemY >= y1 - margin && itemY <= y2 + margin) {
                     if (item.str.trim()) {
                         linkTexts.push(item.str.trim());
-                        console.log(`Found text near link: "${item.str.trim()}" at [${itemX}, ${itemY}]`);
+                        console.log(`Found text in link: "${item.str.trim()}" at [${itemX}, ${itemY}]`);
                     }
                 }
             }
             
-            // Join and clean up the text
+            // Join the text found directly under the link
             let fullText = linkTexts.join(' ').trim();
             
-            // If still no text found, try getting text from the entire line
-            if (!fullText && textContent.items.length > 0) {
-                // Group items by Y position to find text on same line as link
-                const centerY = (y1 + y2) / 2;
-                const lineItems = textContent.items.filter(item => {
-                    const itemY = item.transform[5];
-                    return Math.abs(itemY - centerY) < 20;
-                });
+            // Clean up the text to extract just the chapter title
+            if (fullText) {
+                // Look for chapter patterns and extract just that part
+                const chapterMatch = fullText.match(/(Chapter\s+\d+[^.]*?)(?:\s*\.{3,}|\s+\d+|$)/i);
+                if (chapterMatch) {
+                    fullText = chapterMatch[1].trim();
+                } else {
+                    // Try other patterns
+                    const patterns = [
+                        /(\d+\.\d+\s+[^.]+?)(?:\s*\.{3,}|\s+\d+|$)/,  // "1.1 Section Name"
+                        /(\d+\s+[^.]+?)(?:\s*\.{3,}|\s+\d+|$)/,       // "1 Section Name"
+                        /([A-Z][^.]+?)(?:\s*\.{3,}|\s+\d+|$)/        // "Appendix A"
+                    ];
+                    
+                    for (const pattern of patterns) {
+                        const match = fullText.match(pattern);
+                        if (match) {
+                            fullText = match[1].trim();
+                            break;
+                        }
+                    }
+                }
                 
-                if (lineItems.length > 0) {
-                    fullText = lineItems.map(item => item.str).join(' ').trim();
-                    console.log(`Found text on same line: "${fullText}"`);
+                // Remove trailing dots and page numbers
+                fullText = fullText.replace(/\.+$/, '').replace(/\s+\d+\s*$/, '').trim();
+                
+                // If text is too long, truncate at first sentence or reasonable length
+                if (fullText.length > 60) {
+                    const firstSentence = fullText.split('.')[0];
+                    if (firstSentence.length > 10 && firstSentence.length < fullText.length) {
+                        fullText = firstSentence;
+                    } else {
+                        fullText = fullText.substring(0, 60).trim();
+                    }
                 }
             }
-            
-            // Remove page numbers from the end
-            fullText = fullText.replace(/\s+\d+\s*$/, '').replace(/\.+$/, '').trim();
             
             console.log(`Final extracted text: "${fullText}"`);
             return fullText;
