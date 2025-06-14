@@ -119,6 +119,249 @@ class EpubDB {
 // Global database instance
 const epubDB = new EpubDB();
 
+// PDF parsing functions
+class PDFParser {
+    static async parsePDF(arrayBuffer) {
+        // Check if PDF.js is loaded
+        if (typeof pdfjsLib === 'undefined') {
+            throw new Error('PDF.js library not loaded');
+        }
+        
+        // Validate input
+        if (!arrayBuffer || arrayBuffer.byteLength === 0) {
+            throw new Error('Invalid PDF: Empty or corrupted file');
+        }
+        
+        try {
+            console.log('Loading PDF document, size:', arrayBuffer.byteLength);
+            const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+            const numPages = pdf.numPages;
+            
+            // Extract title from metadata or use filename
+            const metadata = await pdf.getMetadata();
+            const title = metadata.info.Title || 'PDF Document';
+            
+            // Try to extract real chapters from PDF structure
+            let chapters = await this.extractChaptersFromOutline(pdf);
+            
+            // If no outline found, try to detect chapters from content
+            if (!chapters || chapters.length === 0) {
+                console.log('No PDF outline found, detecting chapters from content...');
+                chapters = await this.detectChaptersFromContent(pdf, numPages);
+            }
+            
+            // If still no chapters found, fall back to page-based chapters
+            if (!chapters || chapters.length === 0) {
+                console.log('No chapters detected, creating page-based chapters...');
+                chapters = await this.createPageBasedChapters(pdf, numPages);
+            }
+            
+            return { title, chapters, numPages, type: 'pdf' };
+        } catch (error) {
+            console.error('Error parsing PDF:', error);
+            throw error;
+        }
+    }
+    
+    static async extractChaptersFromOutline(pdf) {
+        try {
+            const outline = await pdf.getOutline();
+            if (!outline || outline.length === 0) {
+                return null;
+            }
+            
+            const chapters = [];
+            const allOutlineItems = [];
+            
+            // Flatten the outline structure (handle nested items)
+            const flattenOutline = async (items, level = 0) => {
+                for (const item of items) {
+                    if (item.dest) {
+                        try {
+                            const destination = await pdf.getDestination(item.dest);
+                            if (destination) {
+                                const pageIndex = await pdf.getPageIndex(destination[0]);
+                                allOutlineItems.push({
+                                    title: item.title,
+                                    pageNumber: pageIndex + 1,
+                                    level: level
+                                });
+                            }
+                        } catch (e) {
+                            console.warn('Error processing outline item:', item.title, e);
+                        }
+                    }
+                    
+                    // Process nested items
+                    if (item.items && item.items.length > 0) {
+                        await flattenOutline(item.items, level + 1);
+                    }
+                }
+            };
+            
+            // Flatten the entire outline
+            await flattenOutline(outline);
+            
+            // Sort by page number
+            allOutlineItems.sort((a, b) => a.pageNumber - b.pageNumber);
+            
+            // Create chapters from flattened outline
+            for (let i = 0; i < allOutlineItems.length; i++) {
+                const item = allOutlineItems[i];
+                const nextItem = allOutlineItems[i + 1];
+                
+                chapters.push({
+                    title: item.title,
+                    startPage: item.pageNumber,
+                    endPage: nextItem ? nextItem.pageNumber - 1 : pdf.numPages,
+                    type: 'pdf-chapter',
+                    level: item.level
+                });
+            }
+            
+            return chapters;
+        } catch (error) {
+            console.log('Error extracting outline:', error);
+            return null;
+        }
+    }
+    
+    static async detectChaptersFromContent(pdf, numPages) {
+        const chapters = [];
+        const chapterPatterns = [
+            /^(Chapter|CHAPTER|Chap\.?)\s+(\d+|[IVXLCDM]+)/,
+            /^(Section|SECTION|Sec\.?)\s+(\d+|[IVXLCDM]+)/,
+            /^(Part|PART)\s+(\d+|[IVXLCDM]+)/,
+            /^(\d+)\.\s+\w+/,  // "1. Introduction"
+            /^(Introduction|Conclusion|Preface|Epilogue|Appendix|Bibliography|References|Index)/i,
+            /^(Foreword|Acknowledgments|Dedication|Abstract|Summary)/i
+        ];
+        
+        let currentChapter = null;
+        const potentialChapters = [];
+        
+        // First pass: collect all potential chapter headings
+        for (let pageNum = 1; pageNum <= numPages; pageNum++) {
+            try {
+                const page = await pdf.getPage(pageNum);
+                const textContent = await page.getTextContent();
+                
+                // Combine text items to handle split headings
+                let pageText = '';
+                const firstItems = [];
+                
+                for (let i = 0; i < Math.min(10, textContent.items.length); i++) {
+                    const item = textContent.items[i];
+                    if (item.str.trim()) {
+                        firstItems.push({
+                            text: item.str.trim(),
+                            fontSize: item.height,
+                            y: item.transform[5]
+                        });
+                        pageText += item.str + ' ';
+                    }
+                }
+                
+                // Check combined text for patterns
+                const combinedText = pageText.trim();
+                for (const pattern of chapterPatterns) {
+                    const match = combinedText.match(pattern);
+                    if (match) {
+                        // Look for the item with largest font size (likely the heading)
+                        const largestItem = firstItems.reduce((prev, current) => 
+                            (current.fontSize > prev.fontSize) ? current : prev
+                        );
+                        
+                        potentialChapters.push({
+                            title: match[0],
+                            pageNum: pageNum,
+                            fontSize: largestItem.fontSize,
+                            confidence: largestItem.fontSize > 12 ? 'high' : 'medium'
+                        });
+                        break;
+                    }
+                }
+            } catch (error) {
+                console.warn(`Error processing page ${pageNum}:`, error);
+            }
+        }
+        
+        // Second pass: filter chapters based on consistency
+        if (potentialChapters.length > 0) {
+            // Find the most common font size for chapters
+            const fontSizes = potentialChapters.map(ch => ch.fontSize);
+            const avgFontSize = fontSizes.reduce((a, b) => a + b) / fontSizes.length;
+            
+            // Keep chapters with similar font sizes or high confidence
+            const validChapters = potentialChapters.filter(ch => 
+                ch.confidence === 'high' || 
+                Math.abs(ch.fontSize - avgFontSize) < 2
+            );
+            
+            // Create final chapter list
+            for (let i = 0; i < validChapters.length; i++) {
+                const chapter = validChapters[i];
+                const nextChapter = validChapters[i + 1];
+                
+                chapters.push({
+                    title: chapter.title,
+                    startPage: chapter.pageNum,
+                    endPage: nextChapter ? nextChapter.pageNum - 1 : numPages,
+                    type: 'pdf-chapter'
+                });
+            }
+        }
+        
+        return chapters;
+    }
+    
+    static async createPageBasedChapters(pdf, numPages) {
+        // Fallback: Create single chapter for entire document
+        return [{
+            title: 'Full Document',
+            startPage: 1,
+            endPage: numPages,
+            type: 'pdf-full'
+        }];
+    }
+    
+    static async extractTextFromPDFRange(arrayBuffer, startPage, endPage) {
+        // Check if PDF.js is loaded
+        if (typeof pdfjsLib === 'undefined') {
+            throw new Error('PDF.js library not loaded');
+        }
+        
+        try {
+            const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+            let fullText = '';
+            
+            for (let pageNum = startPage; pageNum <= endPage; pageNum++) {
+                const page = await pdf.getPage(pageNum);
+                const textContent = await page.getTextContent();
+                
+                // Extract text from page
+                let pageText = '';
+                for (const item of textContent.items) {
+                    if (item.str) {
+                        pageText += item.str + ' ';
+                    }
+                }
+                
+                // Add page break and page number
+                if (pageText.trim()) {
+                    fullText += `\n\n--- Page ${pageNum} ---\n\n`;
+                    fullText += pageText.trim() + '\n';
+                }
+            }
+            
+            return fullText.trim();
+        } catch (error) {
+            console.error('Error extracting PDF text:', error);
+            return `[Error extracting text from pages ${startPage}-${endPage}]`;
+        }
+    }
+}
+
 // DOM elements
 const fileInput = document.getElementById('file-input');
 const uploadBtn = document.getElementById('upload-btn');
@@ -145,6 +388,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         await epubDB.init();
         await migrateFromLocalStorage();
         await loadBooks();
+        
+        // Check if PDF.js loaded
+        if (typeof pdfjsLib !== 'undefined') {
+            console.log('PDF.js loaded successfully');
+        } else {
+            console.warn('PDF.js not loaded - PDF support will be disabled');
+        }
     } catch (error) {
         console.error('Failed to initialize database:', error);
         alert('Failed to initialize storage. Some features may not work.');
@@ -213,8 +463,16 @@ async function loadBooks() {
 // Handle file upload
 async function handleUpload() {
     const file = fileInput.files[0];
-    if (!file || !file.name.endsWith('.epub')) {
-        alert('Please select a valid EPUB file');
+    if (!file) {
+        alert('Please select a file');
+        return;
+    }
+    
+    const isEpub = file.name.toLowerCase().endsWith('.epub');
+    const isPdf = file.name.toLowerCase().endsWith('.pdf');
+    
+    if (!isEpub && !isPdf) {
+        alert('Please select a valid EPUB or PDF file');
         return;
     }
     
@@ -223,37 +481,64 @@ async function handleUpload() {
     
     try {
         const arrayBuffer = await file.arrayBuffer();
-        const zip = await JSZip.loadAsync(arrayBuffer);
+        let bookData;
+        let fileBlob;
         
-        // Parse EPUB structure (metadata only for now)
-        const epubData = await parseEpubStructure(zip);
-        
-        // Create book object with metadata
-        const book = {
-            id: Date.now().toString(),
-            title: epubData.title || file.name.replace('.epub', ''),
-            fileName: file.name,
-            chapters: epubData.chapters,
-            uploadDate: new Date().toISOString(),
-            fileSize: file.size
-        };
-        
-        // Create blob from the EPUB file
-        const epubBlob = new Blob([arrayBuffer], { type: 'application/epub+zip' });
+        if (isEpub) {
+            // Process EPUB
+            const zip = await JSZip.loadAsync(arrayBuffer);
+            const epubData = await parseEpubStructure(zip);
+            
+            bookData = {
+                id: Date.now().toString(),
+                title: epubData.title || file.name.replace('.epub', ''),
+                fileName: file.name,
+                chapters: epubData.chapters,
+                uploadDate: new Date().toISOString(),
+                fileSize: file.size,
+                type: 'epub'
+            };
+            
+            fileBlob = new Blob([arrayBuffer], { type: 'application/epub+zip' });
+            
+        } else if (isPdf) {
+            // Process PDF
+            console.log('Processing PDF, size:', arrayBuffer.byteLength);
+            
+            if (arrayBuffer.byteLength === 0) {
+                throw new Error('PDF file is empty');
+            }
+            
+            const pdfData = await PDFParser.parsePDF(arrayBuffer);
+            
+            bookData = {
+                id: Date.now().toString(),
+                title: pdfData.title || file.name.replace('.pdf', ''),
+                fileName: file.name,
+                chapters: pdfData.chapters,
+                uploadDate: new Date().toISOString(),
+                fileSize: file.size,
+                numPages: pdfData.numPages,
+                type: 'pdf'
+            };
+            
+            // Store the original file blob, not arrayBuffer
+            fileBlob = file;
+        }
         
         // Save to IndexedDB
-        await epubDB.addBook(book, epubBlob);
+        await epubDB.addBook(bookData, fileBlob);
         
         // Clear file input and refresh books list
         fileInput.value = '';
         await loadBooks();
         
     } catch (error) {
-        console.error('Error processing EPUB:', error);
+        console.error('Error processing file:', error);
         if (error.name === 'QuotaExceededError') {
-            alert('Storage quota exceeded. Please delete some books or try a smaller EPUB file.');
+            alert('Storage quota exceeded. Please delete some books or try a smaller file.');
         } else {
-            alert('Error processing EPUB file. Please try another file.');
+            alert('Error processing file. Please try another file.');
         }
     } finally {
         uploadBtn.disabled = false;
@@ -433,10 +718,24 @@ function renderBooksList(books) {
     books.forEach(book => {
         const li = document.createElement('li');
         li.className = 'book-item';
+        
+        // Add book type indicator and additional info
+        const bookType = book.type || 'epub';
+        const typeIndicator = bookType.toUpperCase();
+        const additionalInfo = book.numPages ? ` (${book.numPages} pages)` : '';
+        
         li.innerHTML = `
-            <span class="book-title">${book.title}</span>
-            <button class="btn btn-small" onclick="viewBook('${book.id}')">View Chapters</button>
-            <button class="btn btn-small btn-danger" onclick="deleteBook('${book.id}')">Delete</button>
+            <div class="book-info">
+                <span class="book-title">${book.title}</span>
+                <span class="book-meta">
+                    <span class="book-type ${bookType}">${typeIndicator}</span>
+                    ${additionalInfo}
+                </span>
+            </div>
+            <div class="book-actions-list">
+                <button class="btn btn-small" onclick="viewBook('${book.id}')">View Chapters</button>
+                <button class="btn btn-small btn-danger" onclick="deleteBook('${book.id}')">Delete</button>
+            </div>
         `;
         booksList.appendChild(li);
     });
@@ -544,23 +843,39 @@ async function viewChapter(bookId, chapterIndex) {
             return;
         }
         
-        // Load EPUB file and extract chapter content
-        const epubBlob = await epubDB.getEpubFile(bookId);
-        if (!epubBlob) {
-            alert('EPUB file not found');
+        // Load file and extract chapter content
+        const fileBlob = await epubDB.getEpubFile(bookId);
+        if (!fileBlob) {
+            alert('File not found');
             return;
         }
         
-        const arrayBuffer = await epubBlob.arrayBuffer();
-        const zip = await JSZip.loadAsync(arrayBuffer);
+        const arrayBuffer = await fileBlob.arrayBuffer();
         
-        // Get chapter content
-        const content = await zip.file(chapter.href).async('string');
-        const parser = new DOMParser();
-        const doc = parser.parseFromString(content, 'text/html');
+        console.log('File loaded, size:', arrayBuffer.byteLength, 'Type:', book.type);
         
-        // Extract text content
-        const textContent = extractTextFromHtml(doc.body);
+        if (arrayBuffer.byteLength === 0) {
+            throw new Error('File data is empty');
+        }
+        
+        let textContent;
+        
+        if (book.type === 'epub') {
+            // Handle EPUB
+            const zip = await JSZip.loadAsync(arrayBuffer);
+            const content = await zip.file(chapter.href).async('string');
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(content, 'text/html');
+            textContent = extractTextFromHtml(doc.body);
+            
+        } else if (book.type === 'pdf') {
+            // Handle PDF
+            textContent = await PDFParser.extractTextFromPDFRange(
+                arrayBuffer, 
+                chapter.startPage, 
+                chapter.endPage
+            );
+        }
         
         currentChapterContent = textContent;
         
@@ -661,20 +976,29 @@ async function downloadFullBook() {
     showLoadingIndicator(totalChapters);
     
     try {
-        // Load EPUB file
-        const epubBlob = await epubDB.getEpubFile(currentBook.id);
-        if (!epubBlob) {
-            alert('EPUB file not found');
+        // Load file
+        const fileBlob = await epubDB.getEpubFile(currentBook.id);
+        if (!fileBlob) {
+            alert('File not found');
             return;
         }
         
-        const arrayBuffer = await epubBlob.arrayBuffer();
-        const zip = await JSZip.loadAsync(arrayBuffer);
+        const arrayBuffer = await fileBlob.arrayBuffer();
+        
+        console.log('Full book download - File loaded, size:', arrayBuffer.byteLength);
+        
+        if (arrayBuffer.byteLength === 0) {
+            throw new Error('File data is empty');
+        }
         
         // Extract all chapter content
         let fullBookText = '';
         fullBookText += `${currentBook.title}\n`;
         fullBookText += '='.repeat(currentBook.title.length) + '\n\n';
+        
+        if (currentBook.type === 'pdf') {
+            fullBookText += `PDF Document (${currentBook.numPages} pages)\n\n`;
+        }
         
         for (let i = 0; i < currentBook.chapters.length; i++) {
             const chapter = currentBook.chapters[i];
@@ -683,13 +1007,24 @@ async function downloadFullBook() {
             updateLoadingProgress(i, totalChapters);
             
             try {
-                // Get chapter content
-                const content = await zip.file(chapter.href).async('string');
-                const parser = new DOMParser();
-                const doc = parser.parseFromString(content, 'text/html');
+                let textContent;
                 
-                // Extract text content
-                const textContent = extractTextFromHtml(doc.body);
+                if (currentBook.type === 'epub') {
+                    // Handle EPUB
+                    const zip = await JSZip.loadAsync(arrayBuffer);
+                    const content = await zip.file(chapter.href).async('string');
+                    const parser = new DOMParser();
+                    const doc = parser.parseFromString(content, 'text/html');
+                    textContent = extractTextFromHtml(doc.body);
+                    
+                } else if (currentBook.type === 'pdf') {
+                    // Handle PDF
+                    textContent = await PDFParser.extractTextFromPDFRange(
+                        arrayBuffer, 
+                        chapter.startPage, 
+                        chapter.endPage
+                    );
+                }
                 
                 // Add chapter to full text
                 fullBookText += `\n\n--- ${chapter.title} ---\n\n`;
@@ -701,7 +1036,7 @@ async function downloadFullBook() {
                 }
                 
             } catch (error) {
-                console.warn('Error processing chapter:', chapter.href, error);
+                console.warn('Error processing chapter:', chapter, error);
                 fullBookText += `\n\n--- ${chapter.title} ---\n\n`;
                 fullBookText += '[Error loading chapter content]';
             }

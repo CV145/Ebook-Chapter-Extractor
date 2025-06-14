@@ -15,8 +15,8 @@
         <main>
             <!-- File Upload Section -->
             <section id="upload-section" class="card">
-                <h2>Upload EPUB</h2>
-                <input type="file" id="file-input" accept=".epub" />
+                <h2>Upload EPUB or PDF</h2>
+                <input type="file" id="file-input" accept=".epub,.pdf" />
                 <button id="upload-btn" class="btn btn-primary">Upload</button>
             </section>
             
@@ -60,6 +60,13 @@
     </div>
     
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script>
+        // Wait for PDF.js to load
+        if (typeof pdfjsLib !== 'undefined') {
+            pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+        }
+    </script>
     <script src="app.js"></script>
 </body>
 </html>
