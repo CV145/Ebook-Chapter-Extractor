@@ -1369,21 +1369,262 @@ async function viewChapter(bookId, chapterIndex) {
         
         const arrayBuffer = await fileBlob.arrayBuffer();
         
+        // Determine book type if not set (for backward compatibility)
+        if (!book.type) {
+            if (book.fileName) {
+                if (book.fileName.toLowerCase().endsWith('.epub')) {
+                    book.type = 'epub';
+                } else if (book.fileName.toLowerCase().endsWith('.pdf')) {
+                    book.type = 'pdf';
+                }
+            }
+            console.warn('Book type was undefined, inferred as:', book.type);
+        }
+        
         console.log('File loaded, size:', arrayBuffer.byteLength, 'Type:', book.type);
         
         if (arrayBuffer.byteLength === 0) {
             throw new Error('File data is empty');
         }
         
-        let textContent;
+        let textContent = ''; // Initialize to empty string instead of undefined
         
         if (book.type === 'epub') {
-            // Handle EPUB
-            const zip = await JSZip.loadAsync(arrayBuffer);
-            const content = await zip.file(chapter.href).async('string');
-            const parser = new DOMParser();
-            const doc = parser.parseFromString(content, 'text/html');
-            textContent = extractTextFromHtml(doc.body);
+            console.log('Processing EPUB chapter...');
+            try {
+                // Handle EPUB
+                const zip = await JSZip.loadAsync(arrayBuffer);
+            
+            // Check if the chapter file exists in the zip
+            const chapterFile = zip.file(chapter.href);
+            if (!chapterFile) {
+                console.error('Chapter file not found in EPUB:', chapter.href);
+                textContent = 'Error: Chapter file not found in EPUB archive';
+            } else {
+                console.log('Chapter file found, extracting content...');
+                const content = await chapterFile.async('string');
+                console.log('====== EPUB CHAPTER DEBUG ======');
+                console.log('Chapter file:', chapter.href);
+                console.log('Raw content length:', content.length);
+                console.log('First 1000 chars of raw content:');
+                console.log(content.substring(0, 1000));
+                console.log('================================');
+                
+                // First, let's examine what we're dealing with
+                console.log('Raw content type check:');
+                console.log('- Starts with <?xml:', content.startsWith('<?xml'));
+                console.log('- Contains <html:', content.includes('<html'));
+                console.log('- Contains <body:', content.includes('<body'));
+                console.log('- Contains namespace:', content.includes('xmlns'));
+                
+                const parser = new DOMParser();
+                
+                // Try multiple parsing approaches
+                let doc;
+                let parseSuccess = false;
+                
+                // Method 1: Try as XHTML
+                try {
+                    doc = parser.parseFromString(content, 'application/xhtml+xml');
+                    if (doc.documentElement.tagName !== 'parsererror') {
+                        console.log('Successfully parsed as XHTML');
+                        parseSuccess = true;
+                    }
+                } catch (e) {
+                    console.log('XHTML parsing failed:', e.message);
+                }
+                
+                // Method 2: Try as HTML
+                if (!parseSuccess) {
+                    try {
+                        doc = parser.parseFromString(content, 'text/html');
+                        console.log('Parsed as HTML');
+                        parseSuccess = true;
+                    } catch (e) {
+                        console.log('HTML parsing failed:', e.message);
+                    }
+                }
+                
+                // Method 3: If all else fails, create a wrapper
+                if (!parseSuccess) {
+                    console.warn('Standard parsing failed, trying wrapper approach');
+                    const wrappedContent = `<!DOCTYPE html><html><body>${content}</body></html>`;
+                    doc = parser.parseFromString(wrappedContent, 'text/html');
+                }
+                
+                // Get the body element, trying multiple selectors
+                let rootElement = doc.body || 
+                                 doc.querySelector('body') || 
+                                 doc.querySelector('html') ||
+                                 doc.documentElement;
+                
+                if (!rootElement) {
+                    console.error('No root element found in chapter HTML');
+                    console.log('Document structure:', doc);
+                    textContent = 'Error: Could not extract text from chapter';
+                } else {
+                    console.log('Root element found:', rootElement.tagName);
+                    
+                    // First, let's see what we're working with
+                    console.log('Root element:', rootElement);
+                    console.log('Root element tagName:', rootElement.tagName);
+                    console.log('Root element children count:', rootElement.children ? rootElement.children.length : 0);
+                    
+                    // Method 1: Try innerText (most reliable for displayed text)
+                    if (rootElement.innerText !== undefined) {
+                        textContent = rootElement.innerText;
+                        console.log('innerText length:', textContent.length);
+                    }
+                    
+                    // Method 2: Try textContent
+                    if (!textContent || textContent.length === 0) {
+                        textContent = rootElement.textContent || '';
+                        console.log('textContent length:', textContent.length);
+                    }
+                    
+                    // Method 3: If DOM methods fail, try namespace-aware extraction
+                    if (!textContent || textContent.length === 0) {
+                        console.warn('DOM extraction failed, checking for namespaced elements');
+                        
+                        // Try to get all elements regardless of namespace
+                        const allElements = doc.getElementsByTagName('*');
+                        console.log('Total elements in document:', allElements.length);
+                        
+                        // Extract text from all elements
+                        const texts = [];
+                        for (let i = 0; i < allElements.length; i++) {
+                            const elem = allElements[i];
+                            // Skip script and style elements
+                            const tagName = elem.tagName.toLowerCase();
+                            if (tagName === 'script' || tagName === 'style') continue;
+                            
+                            // Get direct text content (not from children)
+                            for (let j = 0; j < elem.childNodes.length; j++) {
+                                const node = elem.childNodes[j];
+                                if (node.nodeType === 3) { // Text node
+                                    const text = node.nodeValue.trim();
+                                    if (text) texts.push(text);
+                                }
+                            }
+                        }
+                        
+                        if (texts.length > 0) {
+                            textContent = texts.join(' ');
+                            console.log('Namespace-aware extraction found', texts.length, 'text pieces');
+                        }
+                    }
+                    
+                    // Method 4: Regex extraction from raw content
+                    if (!textContent || textContent.length === 0) {
+                        console.warn('Namespace extraction failed, trying regex extraction from raw content');
+                        
+                        // Remove scripts and styles
+                        let cleanContent = content;
+                        cleanContent = cleanContent.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '');
+                        cleanContent = cleanContent.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '');
+                        
+                        // Extract text between tags (improved regex)
+                        const textMatches = cleanContent.match(/>([^<]+)</g);
+                        if (textMatches) {
+                            textContent = textMatches
+                                .map(match => match.substring(1, match.length - 1))
+                                .filter(text => text.trim().length > 0)
+                                .join(' ')
+                                .replace(/\s+/g, ' ')
+                                .trim();
+                            console.log('Regex extraction found', textMatches.length, 'matches, final length:', textContent.length);
+                        }
+                    }
+                    
+                    // Clean up the text
+                    if (textContent.length > 0) {
+                        textContent = textContent.replace(/\s+/g, ' ').trim();
+                        console.log('Final cleaned text length:', textContent.length);
+                        console.log('Text preview:', textContent.substring(0, 200));
+                    }
+                    
+                    // Method 3: Try getting all paragraph and heading elements
+                    if (!textContent || textContent.length === 0) {
+                        console.warn('No text from textContent, trying to extract from paragraphs and headings');
+                        const textElements = doc.querySelectorAll('p, h1, h2, h3, h4, h5, h6, div, span, li, td, th, blockquote');
+                        const textParts = [];
+                        textElements.forEach(el => {
+                            const text = (el.textContent || '').trim();
+                            if (text) {
+                                textParts.push(text);
+                            }
+                        });
+                        textContent = textParts.join('\n\n');
+                    }
+                    
+                    // Method 4: Last resort - innerHTML fallback
+                    if (!textContent || textContent.length === 0) {
+                        console.warn('Still no text, trying innerHTML text extraction');
+                        // Get innerHTML and strip tags
+                        let html = rootElement.innerHTML || '';
+                        // Remove script and style content
+                        html = html.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '');
+                        html = html.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '');
+                        // Replace tags with spaces
+                        html = html.replace(/<br\s*\/?>/gi, '\n');
+                        html = html.replace(/<\/p>/gi, '\n\n');
+                        html = html.replace(/<\/div>/gi, '\n');
+                        html = html.replace(/<[^>]+>/g, ' ');
+                        // Decode HTML entities
+                        const tempDiv = document.createElement('div');
+                        tempDiv.innerHTML = html;
+                        textContent = tempDiv.textContent || tempDiv.innerText || '';
+                        textContent = textContent.replace(/\s+/g, ' ').trim();
+                    }
+                    
+                    // Final check to ensure we have content
+                    if (!textContent || textContent.length === 0) {
+                        console.error('Still no text content after all extraction attempts');
+                        console.log('Document HTML preview:', doc.documentElement.innerHTML.substring(0, 1000));
+                        
+                        // Ultimate fallback: strip ALL tags from the original content
+                        console.warn('Using ultimate fallback: stripping all tags from raw content');
+                        textContent = content
+                            .replace(/<!--[\s\S]*?-->/g, '') // Remove comments
+                            .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '') // Remove scripts
+                            .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '') // Remove styles
+                            .replace(/<[^>]+>/g, ' ') // Remove all tags
+                            .replace(/&nbsp;/g, ' ') // Replace nbsp
+                            .replace(/&[^;]+;/g, ' ') // Remove other entities
+                            .replace(/\s+/g, ' ') // Normalize whitespace
+                            .trim();
+                        
+                        if (textContent.length > 0) {
+                            console.log('Ultimate fallback found text, length:', textContent.length);
+                        } else {
+                            textContent = 'Error: No text content could be extracted from this chapter. The chapter file may be empty, corrupted, or use an unsupported format.';
+                        }
+                    }
+                }
+                
+                console.log('EPUB text extraction - Chapter:', chapter.title, 'Text length:', textContent.length);
+                
+                // EMERGENCY FALLBACK: If still no text, just use the raw content
+                if (!textContent || textContent.length === 0) {
+                    console.error('EMERGENCY: All extraction methods failed!');
+                    console.log('Using raw content as last resort');
+                    
+                    // Just strip the most basic tags and use whatever's left
+                    textContent = content
+                        .replace(/<[^>]*>/g, ' ') // Remove ALL tags
+                        .replace(/\s+/g, ' ') // Collapse whitespace
+                        .trim();
+                    
+                    if (textContent.length === 0) {
+                        // If STILL nothing, the file might be truly empty
+                        textContent = `[Debug Info]\nFile: ${chapter.href}\nRaw content length: ${content.length}\nFirst 500 chars: ${content.substring(0, 500)}`;
+                    }
+                }
+            }
+            } catch (epubError) {
+                console.error('Error processing EPUB chapter:', epubError);
+                textContent = `Error processing EPUB: ${epubError.message}`;
+            }
             
         } else if (book.type === 'pdf') {
             // Handle PDF
@@ -1392,15 +1633,46 @@ async function viewChapter(bookId, chapterIndex) {
                 chapter.startPage, 
                 chapter.endPage
             );
+        } else {
+            console.error('Unknown book type:', book.type);
+            textContent = 'Error: Unknown book type';
         }
         
-        currentChapterContent = textContent;
+        // Ensure we're setting the content properly
+        console.log('=== FINAL CONTENT CHECK ===');
+        console.log('Book type:', book.type);
+        console.log('textContent type:', typeof textContent);
+        console.log('textContent value:', textContent);
+        console.log('textContent length:', textContent ? textContent.length : 'null/undefined');
+        
+        if (textContent && textContent.length > 0) {
+            currentChapterContent = textContent;
+            console.log('SUCCESS: Set currentChapterContent, length:', currentChapterContent.length);
+            console.log('First 200 chars:', currentChapterContent.substring(0, 200));
+        } else {
+            console.error('ERROR: textContent is empty or undefined');
+            console.error('Setting error message as content');
+            currentChapterContent = 'Error: No content could be extracted from this chapter. Check console for debug info.';
+        }
         
         // Show content
         hideAllSections();
         contentSection.style.display = 'block';
         chapterTitle.textContent = chapter.title;
-        chapterContent.textContent = textContent;
+        
+        // Make sure the content element exists and update it
+        if (chapterContent) {
+            chapterContent.textContent = currentChapterContent;
+            console.log('Updated DOM element with content, element text length:', chapterContent.textContent.length);
+            
+            // Double-check the element was updated
+            if (chapterContent.textContent.length === 0) {
+                console.error('WARNING: DOM element text is empty after update!');
+                chapterContent.innerHTML = `<pre>${currentChapterContent}</pre>`;
+            }
+        } else {
+            console.error('ERROR: chapterContent DOM element not found!');
+        }
         
     } catch (error) {
         console.error('Error loading chapter:', error);
@@ -1416,36 +1688,95 @@ async function viewChapter(bookId, chapterIndex) {
 
 // Extract text from HTML
 function extractTextFromHtml(element) {
+    if (!element) {
+        console.error('extractTextFromHtml: element is null or undefined');
+        return '';
+    }
+    
+    console.log('Starting text extraction from element:', element.tagName || 'unknown');
+    
     let text = '';
+    let nodeCount = 0;
+    let textNodeCount = 0;
     
     function traverse(node) {
+        if (!node) return;
+        
+        nodeCount++;
+        
         if (node.nodeType === Node.TEXT_NODE) {
-            text += node.textContent;
+            const nodeText = node.textContent || '';
+            // Add all text, even whitespace (we'll clean it up later)
+            if (nodeText) {
+                text += nodeText;
+                textNodeCount++;
+            }
         } else if (node.nodeType === Node.ELEMENT_NODE) {
-            // Add line breaks for block elements
-            const blockElements = ['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'br', 'li'];
-            if (blockElements.includes(node.tagName.toLowerCase())) {
+            // Skip style and script elements
+            const skipElements = ['style', 'script', 'noscript'];
+            const tagName = node.tagName ? node.tagName.toLowerCase() : '';
+            
+            if (skipElements.includes(tagName)) {
+                return;
+            }
+            
+            // Add line breaks for block elements BEFORE processing children
+            const blockElements = ['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'br', 'li', 'section', 'article', 'header', 'footer', 'nav', 'aside', 'blockquote', 'pre', 'td', 'th'];
+            
+            if (blockElements.includes(tagName) && text.length > 0) {
                 text += '\n';
             }
             
-            for (const child of node.childNodes) {
-                traverse(child);
+            // Process child nodes
+            if (node.childNodes && node.childNodes.length > 0) {
+                for (let i = 0; i < node.childNodes.length; i++) {
+                    traverse(node.childNodes[i]);
+                }
             }
             
-            if (blockElements.includes(node.tagName.toLowerCase())) {
+            // Add line break after block element
+            if (blockElements.includes(tagName) && text.length > 0) {
                 text += '\n';
+            }
+            
+            // Add space after inline elements that typically need spacing
+            const spaceAfterElements = ['span', 'a', 'em', 'strong', 'b', 'i', 'u'];
+            if (spaceAfterElements.includes(tagName) && text.length > 0 && !text.endsWith(' ')) {
+                text += ' ';
             }
         }
     }
     
     traverse(element);
     
-    // Clean up excessive line breaks
-    return text.replace(/\n{3,}/g, '\n\n').trim();
+    console.log(`Text extraction complete. Processed ${nodeCount} nodes, found ${textNodeCount} text nodes`);
+    console.log('Raw text length:', text.length);
+    
+    // Clean up whitespace more carefully
+    text = text.replace(/\r\n/g, '\n'); // Normalize line endings
+    text = text.replace(/\n{3,}/g, '\n\n'); // Reduce multiple line breaks to double
+    text = text.replace(/[ \t]+/g, ' '); // Reduce multiple spaces/tabs to single space
+    text = text.replace(/\n[ \t]+/g, '\n'); // Remove leading spaces on lines
+    text = text.replace(/[ \t]+\n/g, '\n'); // Remove trailing spaces on lines
+    text = text.trim();
+    
+    console.log('Cleaned text length:', text.length);
+    if (text.length > 0) {
+        console.log('First 200 chars of extracted text:', text.substring(0, 200));
+    }
+    
+    return text;
 }
 
 // Download chapter as .txt
 function downloadChapter() {
+    // Check if we have content to download
+    if (!currentChapterContent) {
+        console.error('No chapter content to download');
+        alert('No chapter content available to download');
+        return;
+    }
+    
     const fileName = `${chapterTitle.textContent.replace(/[^a-z0-9]/gi, '_')}.txt`;
     const blob = new Blob([currentChapterContent], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
@@ -1508,6 +1839,18 @@ async function downloadFullBook() {
             throw new Error('File data is empty');
         }
         
+        // Determine book type if not set (for backward compatibility)
+        if (!currentBook.type) {
+            if (currentBook.fileName) {
+                if (currentBook.fileName.toLowerCase().endsWith('.epub')) {
+                    currentBook.type = 'epub';
+                } else if (currentBook.fileName.toLowerCase().endsWith('.pdf')) {
+                    currentBook.type = 'pdf';
+                }
+            }
+            console.warn('Book type was undefined, inferred as:', currentBook.type);
+        }
+        
         // Extract all chapter content
         let fullBookText = '';
         fullBookText += `${currentBook.title}\n`;
@@ -1529,10 +1872,42 @@ async function downloadFullBook() {
                 if (currentBook.type === 'epub') {
                     // Handle EPUB
                     const zip = await JSZip.loadAsync(arrayBuffer);
-                    const content = await zip.file(chapter.href).async('string');
-                    const parser = new DOMParser();
-                    const doc = parser.parseFromString(content, 'text/html');
-                    textContent = extractTextFromHtml(doc.body);
+                    
+                    // Check if the chapter file exists in the zip
+                    const chapterFile = zip.file(chapter.href);
+                    if (!chapterFile) {
+                        console.error('Chapter file not found in EPUB:', chapter.href);
+                        textContent = '[Error: Chapter file not found in EPUB archive]';
+                    } else {
+                        const content = await chapterFile.async('string');
+                        const parser = new DOMParser();
+                        
+                        // Try parsing as XHTML first (common in EPUB), then fall back to HTML
+                        let doc;
+                        try {
+                            doc = parser.parseFromString(content, 'application/xhtml+xml');
+                        } catch (e) {
+                            doc = parser.parseFromString(content, 'text/html');
+                        }
+                        
+                        // Get the body element, or fall back to the document element
+                        const rootElement = doc.body || doc.querySelector('body') || doc.documentElement;
+                        
+                        if (!rootElement) {
+                            console.error('No root element found in chapter HTML for:', chapter.title);
+                            textContent = '[Error: Could not extract text from chapter]';
+                        } else {
+                            textContent = extractTextFromHtml(rootElement);
+                            
+                            // If no text was extracted, try alternative approach
+                            if (!textContent || textContent.length === 0) {
+                                console.warn('No text extracted for chapter:', chapter.title);
+                                // Try getting all text content directly
+                                textContent = rootElement.textContent || rootElement.innerText || '';
+                                textContent = textContent.replace(/\s+/g, ' ').trim();
+                            }
+                        }
+                    }
                     
                 } else if (currentBook.type === 'pdf') {
                     // Handle PDF
